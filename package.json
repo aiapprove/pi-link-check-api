@@ -1,0 +1,15 @@
+{
+  "name": "pi-link-check-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node api-server.js",
+    "cli": "node cli.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "playwright": "^1.58.2"
+  }
+}
