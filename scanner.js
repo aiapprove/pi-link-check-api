@@ -74,6 +74,11 @@ function normalizeUrl(href, base) {
   catch { return null; }
 }
 
+function resolveUrl(href, base) {
+  try { return new URL(href, base).href; }
+  catch { return null; }
+}
+
 function isSameOrigin(url, origin) {
   try { return new URL(url).origin === origin; }
   catch { return false; }
@@ -176,6 +181,41 @@ export async function scanUrl(url, options = {}) {
   const visited = new Set();
   const queue = [{ url: crawlTarget, depth: 0 }];
   const results = [];
+  // Global cache: check each PI URL only once across all pages
+  const piCheckCache = new Map();
+
+  async function checkPILink(pi) {
+    // Strip hash for the actual HTTP check (servers ignore fragments)
+    const checkUrl = normalizeUrl(pi.url, pi.url) || pi.url;
+    if (piCheckCache.has(checkUrl)) {
+      const cached = piCheckCache.get(checkUrl);
+      return { url: pi.url, text: pi.text, status: cached.status, ok: cached.ok, issue: cached.issue };
+    }
+    try {
+      const piRes = await fetchWithTimeout(checkUrl, PI_CHECK_TIMEOUT);
+      const s = piRes.status;
+      const body = await piRes.text().catch(() => '');
+      const titleMatch = body.match(/<title[^>]*>([^<]*)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].trim() : '';
+      const hasContent = (body.length > 500) && !/not found|error|404/i.test(title);
+      const ok = (s >= 200 && s < 400) || hasContent;
+      const issue = !ok
+        ? s === 404 ? 'PI not found (404)'
+        : s === 403 ? 'PI access forbidden (403)'
+        : s === 410 ? 'PI page gone (410)'
+        : s === 0 ? 'No response from server'
+        : `Server returned HTTP ${s}`
+        : null;
+      const status = ok ? (s >= 200 && s < 400 ? s : 200) : s;
+      piCheckCache.set(checkUrl, { status, ok, issue });
+      return { url: pi.url, text: pi.text, status, ok, issue };
+    } catch (err) {
+      const isTimeout = err.name === 'AbortError' || err.name === 'TimeoutError';
+      const issue = isTimeout ? 'Connection timed out' : err.message;
+      piCheckCache.set(checkUrl, { status: 0, ok: false, issue });
+      return { url: pi.url, text: pi.text, status: 0, ok: false, issue };
+    }
+  }
 
   async function fetchAndParse(pageUrl, depth) {
     try {
@@ -200,17 +240,20 @@ export async function scanUrl(url, options = {}) {
       $('a[href]').each((_, el) => {
         const href = $(el).attr('href');
         const text = $(el).text().trim();
-        const resolved = normalizeUrl(href, pageUrl);
-        if (!resolved) return;
+        // For crawl links, strip hash to avoid duplicate crawls
+        const crawlResolved = normalizeUrl(href, pageUrl);
+        // For PI links, preserve hash to distinguish anchors (e.g. #trimbow vs #fostair)
+        const fullResolved = resolveUrl(href, pageUrl);
+        if (!crawlResolved) return;
 
-        if (isSameOrigin(resolved, origin) && !linkSeen.has(resolved)) {
-          linkSeen.add(resolved);
-          links.push(resolved);
+        if (isSameOrigin(crawlResolved, origin) && !linkSeen.has(crawlResolved)) {
+          linkSeen.add(crawlResolved);
+          links.push(crawlResolved);
         }
 
-        if (isPILink(resolved, text) && !piSeen.has(resolved)) {
-          piSeen.add(resolved);
-          piLinks.push({ url: resolved, text: text.slice(0, 120) });
+        if (isPILink(crawlResolved, text) && fullResolved && !piSeen.has(fullResolved)) {
+          piSeen.add(fullResolved);
+          piLinks.push({ url: fullResolved, text: text.slice(0, 120) });
         }
       });
 
@@ -218,34 +261,11 @@ export async function scanUrl(url, options = {}) {
       const isPromo = !excluded && hasPromotionalContent(bodyText);
       const missingPI = isPromo && piLinks.length === 0;
 
-      // Check PI links with fetch HEAD/GET in batches of 5
+      // Check PI links with fetch in batches of 5 (uses global cache)
       const checked = [];
       for (let i = 0; i < piLinks.length; i += 5) {
         const batch = piLinks.slice(i, i + 5);
-        const batchResults = await Promise.all(
-          batch.map(async (pi) => {
-            try {
-              const piRes = await fetchWithTimeout(pi.url, PI_CHECK_TIMEOUT);
-              const s = piRes.status;
-              // Read a small amount of body to check for content
-              const body = await piRes.text().catch(() => '');
-              const titleMatch = body.match(/<title[^>]*>([^<]*)<\/title>/i);
-              const title = titleMatch ? titleMatch[1].trim() : '';
-              const hasContent = (body.length > 500) && !/not found|error|404/i.test(title);
-              const ok = (s >= 200 && s < 400) || hasContent;
-              const issue = !ok
-                ? s === 404 ? 'PI not found (404)'
-                : s === 403 ? 'PI forbidden (403)'
-                : s === 410 ? 'PI gone (410)'
-                : s === 0 ? 'No response'
-                : `HTTP ${s}` : null;
-              return { url: pi.url, text: pi.text, status: ok ? (s >= 200 && s < 400 ? s : 200) : s, ok, ...(issue ? { issue } : {}) };
-            } catch (err) {
-              const isTimeout = err.name === 'AbortError' || err.name === 'TimeoutError';
-              return { url: pi.url, text: pi.text, status: 0, ok: false, issue: isTimeout ? 'Timeout' : err.message };
-            }
-          })
-        );
+        const batchResults = await Promise.all(batch.map(checkPILink));
         checked.push(...batchResults);
       }
 
@@ -291,8 +311,10 @@ export async function scanUrl(url, options = {}) {
 
   // ── Build response ──────────────────────────────────────────────────────
   const allLinks = results.flatMap((r) => r.pi_links);
+  // Deduplicate PI links globally for the summary count
+  const uniquePIUrls = new Set(allLinks.map((l) => l.url));
   const pass = allLinks.filter((l) => l.ok).length;
-  const fail = allLinks.filter((l) => !l.ok).length;
+  const fail = allLinks.filter((l) => !l.ok && l.issue !== null).length;
   const warn = results.filter((r) => r.missing_pi).length;
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -301,6 +323,12 @@ export async function scanUrl(url, options = {}) {
     pages_scanned: results.length,
     scan_time_seconds: parseFloat(elapsed),
     results,
-    summary: { total: allLinks.length, pass, fail, warn, missing_pi_pages: warn },
+    summary: {
+      pages_scanned: results.length,
+      pi_links_found: uniquePIUrls.size,
+      pass,
+      fail,
+      warn,
+    },
   };
 }
