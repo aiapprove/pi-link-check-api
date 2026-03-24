@@ -1,10 +1,10 @@
 import * as cheerio from 'cheerio';
-import { chromium } from 'playwright';
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const PAGE_TIMEOUT = 10000;
+const FETCH_TIMEOUT = 10000;
 const PI_CHECK_TIMEOUT = 8000;
-const CONCURRENT = 3;
+const CONCURRENT = 5;
+const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // ── Patterns ────────────────────────────────────────────────────────────────
 const PROMO_PATTERNS = [
@@ -36,16 +36,6 @@ const PI_TEXT_PATTERNS = [
   /\bpi\s+(?:available|link|document)\b/i,
 ];
 
-const GATE_BUTTON_PATTERNS = [
-  /i[\u2019']?\s*a?m\s+a\s+(?:\w+\s+)*(?:hcp|healthcare\s+professional)/i,
-  /yes,?\s+i[\u2019']?\s*a?m\s+a?\s*(?:\w+\s+)*(?:healthcare|medical)\s+professional/i,
-  /i\s+am\s+(?:a\s+)?(?:\w+\s+)*(?:prescrib|doctor|physician|pharmacist|nurse|clinician)/i,
-  /enter\s+(?:the\s+)?(?:hcp\s+)?site/i,
-  /proceed\s+to\s+(?:the\s+)?site/i,
-  /i\s+(?:confirm|agree|accept|certif)/i,
-  /continue\s+(?:to|as)\s+(?:a\s+)?(?:\w+\s+)*(?:professional|hcp|site|website)/i,
-  /access\s+(?:the\s+)?(?:hcp|professional|medical)\s+(?:site|content|area)/i,
-];
 const GATE_PAGE_PATTERNS = [
   /(?:intended\s+(?:only\s+)?for|designed\s+for)\s+(?:qualified\s+)?(?:healthcare|medical)\s+professional/i,
   /are\s+you\s+a\s+(?:healthcare|medical)\s+professional/i,
@@ -53,21 +43,14 @@ const GATE_PAGE_PATTERNS = [
   /may\s+contain\s+promotional\s+(?:content|material)/i,
 ];
 
-const COOKIE_BANNER_SELECTORS = [
-  '#onetrust-accept-btn-handler',
-  '.onetrust-close-btn-handler',
-  '#acceptAllDiv',
-  '#accept-all-text',
-  '[id*="cookie"] button[class*="accept"]',
-  '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-  '.cc-btn.cc-dismiss',
-  'button:has-text("Accept All Cookies")',
-  'button:has-text("Accept all cookies")',
-  'button:has-text("Accept All")',
-  'button:has-text("Accept all")',
-  'button:has-text("Allow all")',
-  'button:has-text("Allow All")',
-  '[data-testid="cookie-accept"]',
+const GATE_LINK_PATTERNS = [
+  /i[\u2019']?\s*a?m\s+a\s+(?:\w+\s+)*(?:hcp|healthcare\s+professional)/i,
+  /yes,?\s+i[\u2019']?\s*a?m\s+a?\s*(?:\w+\s+)*(?:healthcare|medical)\s+professional/i,
+  /enter\s+(?:the\s+)?(?:hcp\s+)?site/i,
+  /proceed\s+to\s+(?:the\s+)?site/i,
+  /i\s+(?:confirm|agree|accept|certif)/i,
+  /continue\s+(?:to|as)\s+(?:a\s+)?(?:\w+\s+)*(?:professional|hcp|site|website)/i,
+  /access\s+(?:the\s+)?(?:hcp|professional|medical)\s+(?:site|content|area)/i,
 ];
 
 // Pages excluded from PI link requirements (press releases, corporate pages)
@@ -124,6 +107,21 @@ function isExcludedPage(url) {
   } catch { return false; }
 }
 
+async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html,application/xhtml+xml,*/*' },
+      redirect: 'follow',
+    });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Main scan function ──────────────────────────────────────────────────────
 export async function scanUrl(url, options = {}) {
   const maxDepth = options.maxDepth ?? 2;
@@ -132,112 +130,64 @@ export async function scanUrl(url, options = {}) {
   const onProgress = options.onProgress ?? (() => {});
 
   const startTime = Date.now();
-
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  });
-
   let crawlTarget = url;
   const origin = new URL(url).origin;
 
-  // ── Cookie banner dismissal ─────────────────────────────────────────────
-  async function dismissCookieBanner(page) {
-    for (const sel of COOKIE_BANNER_SELECTORS) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 500 })) {
-          await btn.click({ timeout: 2000 });
-          await page.waitForTimeout(500);
-          return;
-        }
-      } catch {}
-    }
-  }
-
-  // ── Gateway breaker ─────────────────────────────────────────────────────
+  // ── Gateway detection (fetch-based) ───────────────────────────────────────
+  // With fetch we can't click buttons, but we can detect gate pages and
+  // follow any <a> links that match HCP confirmation patterns.
   if (!skipGate) {
-    const page = await context.newPage();
     try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
-      await page.waitForTimeout(1000);
-      await dismissCookieBanner(page);
+      const res = await fetchWithTimeout(url, 15000);
+      if (res.ok) {
+        const html = await res.text();
+        const $ = cheerio.load(html);
+        const bodyText = $('body').text();
+        const isGatePage = GATE_PAGE_PATTERNS.some((p) => p.test(bodyText));
 
-      const bodyText = await page.textContent('body') || '';
-      const isGatePage = GATE_PAGE_PATTERNS.some((p) => p.test(bodyText));
+        if (isGatePage) {
+          onProgress({ type: 'gateway', message: 'HCP gateway detected — looking for confirmation link' });
 
-      if (isGatePage) {
-        onProgress({ type: 'gateway', message: 'HCP gateway detected' });
-
-        for (const cb of await page.locator('input[type="checkbox"]').all()) {
-          try {
-            if (!await cb.isVisible()) continue;
-            const id = await cb.getAttribute('id');
-            let labelText = id ? (await page.locator(`label[for="${id}"]`).textContent().catch(() => '')) || '' : '';
-            if (!labelText) labelText = await cb.locator('xpath=ancestor::label').textContent().catch(() => '') || '';
-            if (/(?:confirm|agree|professional|hcp|certif|acknowledg)/i.test(labelText)) {
-              await cb.check();
+          // Find <a> links that look like gate confirmation
+          let gateHref = null;
+          $('a[href]').each((_, el) => {
+            if (gateHref) return;
+            const text = $(el).text().trim();
+            const href = $(el).attr('href');
+            if (text && GATE_LINK_PATTERNS.some((p) => p.test(text)) && href) {
+              gateHref = normalizeUrl(href, url);
             }
-          } catch {}
-        }
+          });
 
-        const candidates = [];
-        for (const el of await page.locator('a, button, input[type="submit"], input[type="button"], [role="button"]').all()) {
-          try {
-            if (!await el.isVisible({ timeout: 300 })) continue;
-            const text = ((await el.textContent()) || '').trim();
-            const value = (await el.getAttribute('value')) || '';
-            const label = text || value;
-            if (label && GATE_BUTTON_PATTERNS.some((p) => p.test(label))) {
-              candidates.push({ el, label });
-            }
-          } catch {}
-        }
-
-        if (candidates.length > 0) {
-          candidates.sort((a, b) => b.label.length - a.label.length);
-          await candidates[0].el.click({ timeout: 5000, force: true });
-          await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-          await page.waitForTimeout(2000);
-
-          const finalUrl = page.url();
-          if (new URL(finalUrl).origin !== new URL(url).origin) {
-            crawlTarget = finalUrl;
+          if (gateHref) {
+            crawlTarget = gateHref;
+            onProgress({ type: 'gateway', message: `Following gate link: ${gateHref}` });
+          } else {
+            onProgress({ type: 'gateway', message: 'Gate page detected but no confirmation link found (JS-only gate)' });
           }
-          onProgress({ type: 'gateway', message: 'Gateway cleared' });
         }
       }
     } catch (err) {
       onProgress({ type: 'error', message: `Gateway check error: ${err.message}` });
     }
-    await page.close();
   }
 
-  // ── Page renderer ─────────────────────────────────────────────────────────
+  // ── Fetch and parse a page ────────────────────────────────────────────────
   const visited = new Set();
   const queue = [{ url: crawlTarget, depth: 0 }];
   const results = [];
 
-  async function renderAndParse(pageUrl, depth) {
-    const page = await context.newPage();
-
+  async function fetchAndParse(pageUrl, depth) {
     try {
-      const response = await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT });
-      if (!response) { await page.close(); return { result: null, links: [] }; }
+      const res = await fetchWithTimeout(pageUrl);
+      const status = res.status;
 
-      const status = response.status();
-      if (status === 403 || status === 401) {
-        await page.close();
-        return { result: null, links: [] };
-      }
+      if (status === 403 || status === 401) return { result: null, links: [] };
 
-      const ct = response.headers()['content-type'] || '';
-      if (!ct.includes('text/html')) { await page.close(); return { result: null, links: [] }; }
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('text/html')) return { result: null, links: [] };
 
-      await page.waitForTimeout(500);
-      const html = await page.content();
-      await page.close();
-
+      const html = await res.text();
       const $ = cheerio.load(html);
       $('script, style, noscript').remove();
       const bodyText = $('body').text();
@@ -268,19 +218,20 @@ export async function scanUrl(url, options = {}) {
       const isPromo = !excluded && hasPromotionalContent(bodyText);
       const missingPI = isPromo && piLinks.length === 0;
 
-      // Check PI links in batches of 5 to avoid overwhelming the browser
+      // Check PI links with fetch HEAD/GET in batches of 5
       const checked = [];
       for (let i = 0; i < piLinks.length; i += 5) {
         const batch = piLinks.slice(i, i + 5);
         const batchResults = await Promise.all(
           batch.map(async (pi) => {
             try {
-              const checkPage = await context.newPage();
-              const res = await checkPage.goto(pi.url, { waitUntil: 'domcontentloaded', timeout: PI_CHECK_TIMEOUT });
-              const s = res ? res.status() : 0;
-              const title = await checkPage.title().catch(() => '');
-              await checkPage.close();
-              const hasContent = title && title.length > 5 && !/not found|error|404/i.test(title);
+              const piRes = await fetchWithTimeout(pi.url, PI_CHECK_TIMEOUT);
+              const s = piRes.status;
+              // Read a small amount of body to check for content
+              const body = await piRes.text().catch(() => '');
+              const titleMatch = body.match(/<title[^>]*>([^<]*)<\/title>/i);
+              const title = titleMatch ? titleMatch[1].trim() : '';
+              const hasContent = (body.length > 500) && !/not found|error|404/i.test(title);
               const ok = (s >= 200 && s < 400) || hasContent;
               const issue = !ok
                 ? s === 404 ? 'PI not found (404)'
@@ -290,7 +241,8 @@ export async function scanUrl(url, options = {}) {
                 : `HTTP ${s}` : null;
               return { url: pi.url, text: pi.text, status: ok ? (s >= 200 && s < 400 ? s : 200) : s, ok, ...(issue ? { issue } : {}) };
             } catch (err) {
-              return { url: pi.url, text: pi.text, status: 0, ok: false, issue: err.name === 'TimeoutError' ? 'Timeout' : err.message };
+              const isTimeout = err.name === 'AbortError' || err.name === 'TimeoutError';
+              return { url: pi.url, text: pi.text, status: 0, ok: false, issue: isTimeout ? 'Timeout' : err.message };
             }
           })
         );
@@ -304,8 +256,7 @@ export async function scanUrl(url, options = {}) {
         result: { page: short, pi_links: checked, has_promotional_content: isPromo, missing_pi: missingPI, ...(excluded ? { excluded: true } : {}) },
         links,
       };
-    } catch (err) {
-      await page.close().catch(() => {});
+    } catch {
       return { result: null, links: [] };
     }
   }
@@ -321,7 +272,7 @@ export async function scanUrl(url, options = {}) {
       batch.push({ url: norm, depth: item.depth });
     }
 
-    const settled = await Promise.allSettled(batch.map((b) => renderAndParse(b.url, b.depth)));
+    const settled = await Promise.allSettled(batch.map((b) => fetchAndParse(b.url, b.depth)));
 
     for (let i = 0; i < settled.length; i++) {
       if (settled[i].status !== 'fulfilled') continue;
@@ -337,8 +288,6 @@ export async function scanUrl(url, options = {}) {
       }
     }
   }
-
-  await browser.close();
 
   // ── Build response ──────────────────────────────────────────────────────
   const allLinks = results.flatMap((r) => r.pi_links);
