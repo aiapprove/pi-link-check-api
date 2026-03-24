@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: pi-link-check-api
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
