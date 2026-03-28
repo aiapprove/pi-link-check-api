@@ -1,3 +1,4 @@
 node_modules/
 pi-report-*.json
 .env
+data/

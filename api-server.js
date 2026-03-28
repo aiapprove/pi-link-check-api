@@ -1,6 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import { scanUrl } from './scanner.js';
+import { saveScan, getScanHistory, getLatestScan, getAlerts, extractDomain } from './db.js';
+import { processAlerts } from './alerts.js';
+import { generateReport } from './pdf-report.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,7 +47,6 @@ app.post('/api/scan', async (req, res) => {
 
   activeScanCount.value++;
 
-  // Set a 60-second timeout for the scan
   const timeout = setTimeout(() => {
     if (!res.headersSent) {
       res.status(504).json({ error: 'Scan timed out after 60 seconds' });
@@ -58,7 +60,16 @@ app.post('/api/scan', async (req, res) => {
       skipGate: skipGate ?? false,
     });
     clearTimeout(timeout);
+
     if (!res.headersSent) {
+      // Save to database
+      const scanId = saveScan(url, result);
+
+      // Process alerts
+      const alerts = processAlerts(url, scanId, result);
+      result.alerts = alerts;
+      result.scan_id = Number(scanId);
+
       res.json(result);
     }
   } catch (err) {
@@ -69,6 +80,36 @@ app.post('/api/scan', async (req, res) => {
   } finally {
     activeScanCount.value--;
   }
+});
+
+// ── Reports: scan history for a domain ──────────────────────────────────────
+app.get('/api/reports/:domain', (req, res) => {
+  const history = getScanHistory(req.params.domain);
+  res.json({ domain: req.params.domain, scans: history });
+});
+
+// ── Reports: latest scan for a domain ───────────────────────────────────────
+app.get('/api/reports/:domain/latest', (req, res) => {
+  const scan = getLatestScan(req.params.domain);
+  if (!scan) return res.status(404).json({ error: 'No scans found for this domain' });
+  res.json(scan);
+});
+
+// ── Reports: PDF compliance report ──────────────────────────────────────────
+app.get('/api/reports/:domain/pdf', (req, res) => {
+  const scan = getLatestScan(req.params.domain);
+  if (!scan) return res.status(404).json({ error: 'No scans found for this domain' });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="pi-compliance-${req.params.domain}.pdf"`);
+
+  generateReport(scan, res);
+});
+
+// ── Alerts: alert history for a domain ──────────────────────────────────────
+app.get('/api/alerts/:domain', (req, res) => {
+  const alerts = getAlerts(req.params.domain);
+  res.json({ domain: req.params.domain, alerts });
 });
 
 app.listen(PORT, () => {
