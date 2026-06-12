@@ -4,6 +4,9 @@ import { scanUrl } from './scanner.js';
 import { saveScan, getScanHistory, getLatestScan, getAlerts, extractDomain } from './db.js';
 import { processAlerts } from './alerts.js';
 import { generateReport } from './pdf-report.js';
+import { sendFailureAlert } from './notify.js';
+
+const VERSION = '1.1.0';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,7 +24,7 @@ app.use(cors({
 
 // ── Health check ────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.json({ status: 'ok', version: VERSION, uptime: process.uptime() });
 });
 
 // ── Scan endpoint ───────────────────────────────────────────────────────────
@@ -50,6 +53,7 @@ app.post('/api/scan', async (req, res) => {
   const timeout = setTimeout(() => {
     if (!res.headersSent) {
       res.status(504).json({ error: 'Scan timed out after 60 seconds' });
+      sendFailureAlert({ targetUrl: url, reason: 'Scan timed out after 60 seconds server-side' });
     }
   }, 60000);
 
@@ -70,10 +74,32 @@ app.post('/api/scan', async (req, res) => {
       result.alerts = alerts;
       result.scan_id = Number(scanId);
 
+      if (result.pages_scanned === 0) {
+        // The scan "succeeded" but saw nothing — treat as a failed run.
+        console.error('[scan-fail]', JSON.stringify({ ts: new Date().toISOString(), url, reason: 'zero pages scanned' }));
+        sendFailureAlert({ targetUrl: url, reason: 'Scan completed but zero pages could be read (site blocked the crawler, requires JavaScript, or is unreachable)' });
+      } else {
+        console.log('[scan-log]', JSON.stringify({
+          ts: new Date().toISOString(),
+          scan_id: result.scan_id,
+          url,
+          pages: result.summary.pages_scanned,
+          pi_links: result.summary.pi_links_found,
+          pass: result.summary.pass,
+          fail: result.summary.fail,
+          warn: result.summary.warn,
+          js_rendered_pages: result.summary.js_rendered_pages,
+          seconds: result.scan_time_seconds,
+          discovery: result.discovery,
+        }));
+      }
+
       res.json(result);
     }
   } catch (err) {
     clearTimeout(timeout);
+    console.error('[scan-fail]', JSON.stringify({ ts: new Date().toISOString(), url, reason: err.message }));
+    sendFailureAlert({ targetUrl: url, reason: 'Scan crashed', detail: err.message });
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
     }
