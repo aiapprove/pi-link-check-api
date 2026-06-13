@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import dns from 'node:dns/promises';
 
 // Failure alerts are emailed to the CEO inbox. Configure on Render:
 //   ALERT_SMTP_USER  — Gmail address used as the SMTP sender
@@ -8,19 +9,16 @@ import nodemailer from 'nodemailer';
 const SMTP_USER = process.env.ALERT_SMTP_USER;
 const SMTP_PASS = process.env.ALERT_SMTP_PASS;
 const ALERT_TO = process.env.ALERT_TO || 'ceo.aiapprove@gmail.com';
+const SMTP_HOST = 'smtp.gmail.com';
 
-const transporter = SMTP_USER && SMTP_PASS
-  ? nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
-      // Render's free tier has no outbound IPv6; smtp.gmail.com resolves to
-      // an IPv6 address first, so force IPv4 to avoid ENETUNREACH.
-      family: 4,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
-    })
-  : null;
+const credsPresent = Boolean(SMTP_USER && SMTP_PASS);
 
+// Render's free tier has no outbound IPv6. nodemailer does its own hostname
+// resolution and ignores both the transport `family` option and Node's
+// dns.setDefaultResultOrder, so it kept picking smtp.gmail.com's IPv6 record
+// and failing with ENETUNREACH. We resolve an IPv4 address ourselves at send
+// time and connect to that literal, keeping tls.servername so the Gmail
+// certificate still validates against the hostname.
 export async function sendFailureAlert({ targetUrl, reason, detail }) {
   const body = [
     `PI Link Check scan failed.`,
@@ -33,19 +31,29 @@ export async function sendFailureAlert({ targetUrl, reason, detail }) {
     `Service: pi-link-check-api on Render`,
   ].filter(Boolean).join('\n');
 
-  if (!transporter) {
+  if (!credsPresent) {
     console.error('[scan-fail] alert email NOT sent (ALERT_SMTP_USER/ALERT_SMTP_PASS unset):', JSON.stringify({ targetUrl, reason, detail }));
     return false;
   }
 
   try {
+    const [ipv4] = await dns.resolve4(SMTP_HOST);
+
+    const transporter = nodemailer.createTransport({
+      host: ipv4,
+      port: 465,
+      secure: true,
+      tls: { servername: SMTP_HOST },
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
+
     await transporter.sendMail({
       from: `"PI Link Check" <${SMTP_USER}>`,
       to: ALERT_TO,
-      subject: `⚠️ PI Link Check scan failed — ${targetUrl}`,
+      subject: `PI Link Check scan failed — ${targetUrl}`,
       text: body,
     });
-    console.log('[scan-fail] alert email sent to', ALERT_TO);
+    console.log('[scan-fail] alert email sent to', ALERT_TO, 'via', ipv4);
     return true;
   } catch (err) {
     console.error('[scan-fail] alert email FAILED to send:', err.message);
