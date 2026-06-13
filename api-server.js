@@ -1,3 +1,9 @@
+import dns from 'node:dns';
+// Render's free tier has no outbound IPv6. Node 18+ defaults to returning
+// IPv6 records first, so outbound connections (e.g. SMTP to smtp.gmail.com)
+// hit ENETUNREACH. Force IPv4-first resolution process-wide.
+dns.setDefaultResultOrder('ipv4first');
+
 import express from 'express';
 import cors from 'cors';
 import { scanUrl } from './scanner.js';
@@ -6,7 +12,7 @@ import { processAlerts } from './alerts.js';
 import { generateReport } from './pdf-report.js';
 import { sendFailureAlert } from './notify.js';
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
