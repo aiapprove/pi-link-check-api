@@ -12,7 +12,7 @@ import { processAlerts } from './alerts.js';
 import { generateReport } from './pdf-report.js';
 import { sendFailureAlert } from './notify.js';
 
-const VERSION = '1.1.3';
+const VERSION = '1.2.0';
 
 const app = express();
 const PORT = process.env.PORT || 3000;

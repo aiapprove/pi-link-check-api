@@ -1,24 +1,16 @@
-import nodemailer from 'nodemailer';
-import dns from 'node:dns/promises';
-
-// Failure alerts are emailed to the CEO inbox. Configure on Render:
-//   ALERT_SMTP_USER  — Gmail address used as the SMTP sender
-//   ALERT_SMTP_PASS  — Gmail app password for that address
-//   ALERT_TO         — recipient (defaults to ceo.aiapprove@gmail.com)
-// With no credentials set, alerts degrade to a loud log line.
-const SMTP_USER = process.env.ALERT_SMTP_USER;
-const SMTP_PASS = process.env.ALERT_SMTP_PASS;
+// Failure alerts are emailed to the CEO inbox via Resend's HTTPS API.
+// Render's free tier blocks outbound SMTP (ports 25/465/587 time out), so
+// raw SMTP is not an option here — Resend goes over HTTPS (443).
+//
+// Configure on Render:
+//   RESEND_API_KEY  — Resend API key (https://resend.com/api-keys)
+//   ALERT_FROM      — verified sender (default: alerts@aiapprove.ai)
+//   ALERT_TO        — recipient (default: ceo.aiapprove@gmail.com)
+// With no key set, alerts degrade to a loud log line.
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ALERT_FROM = process.env.ALERT_FROM || 'AI Approve Alerts <alerts@aiapprove.ai>';
 const ALERT_TO = process.env.ALERT_TO || 'ceo.aiapprove@gmail.com';
-const SMTP_HOST = 'smtp.gmail.com';
 
-const credsPresent = Boolean(SMTP_USER && SMTP_PASS);
-
-// Render's free tier has no outbound IPv6. nodemailer does its own hostname
-// resolution and ignores both the transport `family` option and Node's
-// dns.setDefaultResultOrder, so it kept picking smtp.gmail.com's IPv6 record
-// and failing with ENETUNREACH. We resolve an IPv4 address ourselves at send
-// time and connect to that literal, keeping tls.servername so the Gmail
-// certificate still validates against the hostname.
 export async function sendFailureAlert({ targetUrl, reason, detail }) {
   const body = [
     `PI Link Check scan failed.`,
@@ -31,29 +23,33 @@ export async function sendFailureAlert({ targetUrl, reason, detail }) {
     `Service: pi-link-check-api on Render`,
   ].filter(Boolean).join('\n');
 
-  if (!credsPresent) {
-    console.error('[scan-fail] alert email NOT sent (ALERT_SMTP_USER/ALERT_SMTP_PASS unset):', JSON.stringify({ targetUrl, reason, detail }));
+  if (!RESEND_API_KEY) {
+    console.error('[scan-fail] alert email NOT sent (RESEND_API_KEY unset):', JSON.stringify({ targetUrl, reason, detail }));
     return false;
   }
 
   try {
-    const [ipv4] = await dns.resolve4(SMTP_HOST);
-
-    const transporter = nodemailer.createTransport({
-      host: ipv4,
-      port: 465,
-      secure: true,
-      tls: { servername: SMTP_HOST },
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: ALERT_FROM,
+        to: [ALERT_TO],
+        subject: `PI Link Check scan failed — ${targetUrl}`,
+        text: body,
+      }),
     });
 
-    await transporter.sendMail({
-      from: `"PI Link Check" <${SMTP_USER}>`,
-      to: ALERT_TO,
-      subject: `PI Link Check scan failed — ${targetUrl}`,
-      text: body,
-    });
-    console.log('[scan-fail] alert email sent to', ALERT_TO, 'via', ipv4);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error('[scan-fail] alert email FAILED to send:', res.status, errText);
+      return false;
+    }
+
+    console.log('[scan-fail] alert email sent to', ALERT_TO, 'via Resend');
     return true;
   } catch (err) {
     console.error('[scan-fail] alert email FAILED to send:', err.message);
