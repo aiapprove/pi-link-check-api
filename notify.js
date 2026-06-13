@@ -14,6 +14,9 @@ const transporter = SMTP_USER && SMTP_PASS
       host: 'smtp.gmail.com',
       port: 465,
       secure: true,
+      // Render's free tier has no outbound IPv6; smtp.gmail.com resolves to
+      // an IPv6 address first, so force IPv4 to avoid ENETUNREACH.
+      family: 4,
       auth: { user: SMTP_USER, pass: SMTP_PASS },
     })
   : null;
