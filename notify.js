@@ -4,11 +4,14 @@
 //
 // Configure on Render:
 //   RESEND_API_KEY  — Resend API key (https://resend.com/api-keys)
-//   ALERT_FROM      — verified sender (default: alerts@aiapprove.ai)
+//   ALERT_FROM      — sender. Defaults to Resend's onboarding@resend.dev,
+//                     which delivers to the account owner's email with no
+//                     domain verification. Once aiapprove.ai is verified in
+//                     Resend, set this to e.g. alerts@aiapprove.ai.
 //   ALERT_TO        — recipient (default: ceo.aiapprove@gmail.com)
 // With no key set, alerts degrade to a loud log line.
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const ALERT_FROM = process.env.ALERT_FROM || 'AI Approve Alerts <alerts@aiapprove.ai>';
+const ALERT_FROM = process.env.ALERT_FROM || 'AI Approve Alerts <onboarding@resend.dev>';
 const ALERT_TO = process.env.ALERT_TO || 'ceo.aiapprove@gmail.com';
 
 export async function sendFailureAlert({ targetUrl, reason, detail }) {
